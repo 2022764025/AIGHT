@@ -1,0 +1,6 @@
+streamlit>=1.50
+openai
+python-dotenv
+pytest
+altair
+pandas
