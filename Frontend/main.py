@@ -1,11 +1,12 @@
-
+import json
 import sys
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
-import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 ROOT = Path(__file__).resolve().parent.parent
 HERE = Path(__file__).resolve().parent
@@ -20,7 +21,18 @@ from Backend.generator import (
     load_json,
 )
 from checks.checker import load_banned_words, run_checks
-from Frontend.sample_data import PERFORMANCE, REVIEW
+from Frontend.sample_data import (
+    DASHBOARD_METRICS,
+    DEFAULT_PROMPTS,
+    HIGHLIGHTS,
+    INSIGHT_TEXT,
+    LANGUAGE_SHARE,
+    MONTHLY_REVIEWS,
+    PROMPT_CATEGORIES,
+    REVIEW_METRICS,
+    REVIEW_SAMPLES,
+    TOPICS,
+)
 
 
 st.set_page_config(
@@ -38,350 +50,381 @@ languages = load_json("languages.json")
 channels = load_json("channels.json")
 banned = load_banned_words()
 
-LANG_ORDER = ["en", "zh", "ja", "ru", "ko", "fr", "it"]
+LANG_ORDER = ["ko", "en", "ja", "zh", "ru", "fr", "it"]
+PERIODS = ["최근 1개월", "최근 3개월", "최근 6개월", "최근 1년"]
+PURPOSES = [
+    "호텔 위치와 접근성 강조",
+    "객실 및 편의시설 소개",
+    "시즌 패키지 및 이벤트 안내",
+    "친절한 서비스 강조",
+    "고객 FAQ 및 프로모션",
+]
+TONES = ["친근하고 자연스럽게", "고급스럽고 차분하게", "짧고 눈에 띄게"]
 
-MENU = {
-    "대시보드": "home",
-    "리뷰 분석": "review",
-    "콘텐츠 생성": "generate",
-    "프롬프트 보관함": "library",
-    "설정": "settings",
-}
+NAV = [
+    ("home", "▦", "대시보드"),
+    ("review", "◷", "리뷰 분석"),
+    ("generate", "✧", "콘텐츠 생성"),
+    ("library", "▤", "프롬프트 보관함"),
+    ("settings", "⚙", "설정"),
+]
+NAV_LABELS = {page: f"{icon}\u00a0\u00a0\u00a0{label}" for page, icon, label in NAV}
+MENU = {label: page for page, label in NAV_LABELS.items()}
 
+# Streamlit 버전에 따라 너비 옵션 이름이 달라 둘 다 대응한다
+_VERSION = tuple(int(part) for part in st.__version__.split(".")[:2] if part.isdigit())
+STRETCH = {"width": "stretch"} if _VERSION >= (1, 50) else {"use_container_width": True}
+
+
+def H(markup):
+    """들여쓰기·줄바꿈을 없애 마크다운이 HTML을 코드 블록으로 바꾸지 않게 한다."""
+    return "".join(line.strip() for line in markup.strip().splitlines())
+
+
+# ───────────── 상태 ─────────────
+
+st.session_state.setdefault("hotel_name", "Arban Hotel")
+st.session_state.setdefault("hotel_loc", "부산 부산진구 · 서면")
+st.session_state.setdefault("avatar", "AH")
+st.session_state.setdefault("gmaps_link", "https://maps.app.goo.gl/Pu4m5EvnPip9uGMG6")
+st.session_state.setdefault("draft", None)
+
+if "prompts" not in st.session_state:
+    st.session_state["prompts"] = [
+        {"id": index + 1, **item} for index, item in enumerate(DEFAULT_PROMPTS)
+    ]
+    st.session_state["prompt_seq"] = len(DEFAULT_PROMPTS)
+
+
+# ───────────── 콜백 ─────────────
+
+def use_prompt(text):
+    st.session_state["extra_req"] = text
+    st.session_state["nav"] = NAV_LABELS["generate"]
+    st.toast("선택한 프롬프트가 적용되었습니다. [콘텐츠 초안 만들기]를 누르세요.")
+
+
+def delete_prompt(prompt_id):
+    st.session_state["prompts"] = [
+        item for item in st.session_state["prompts"] if item["id"] != prompt_id
+    ]
+    st.toast("프롬프트가 삭제되었습니다.")
+
+
+def save_prompt():
+    title = st.session_state.get("new_prompt_title", "").strip()
+    content = st.session_state.get("new_prompt_content", "").strip()
+
+    if not title or not content:
+        st.toast("제목과 지시문 내용을 모두 입력해 주세요.")
+        return
+
+    st.session_state["prompt_seq"] += 1
+    st.session_state["prompts"].insert(
+        0,
+        {
+            "id": st.session_state["prompt_seq"],
+            "tag": st.session_state.get("new_prompt_tag", PROMPT_CATEGORIES[0]),
+            "title": title,
+            "content": content,
+        },
+    )
+    st.session_state["new_prompt_title"] = ""
+    st.session_state["new_prompt_content"] = ""
+    st.toast("프롬프트 라이브러리에 성공적으로 저장되었습니다.")
+
+
+def save_settings():
+    name = st.session_state.get("input_hotel_name", "").strip()
+    loc = st.session_state.get("input_hotel_loc", "").strip()
+
+    if name:
+        st.session_state["hotel_name"] = name
+        st.session_state["avatar"] = name[:2].upper()
+    if loc:
+        st.session_state["hotel_loc"] = loc
+
+    st.session_state["gmaps_link"] = st.session_state.get("input_gmaps", "").strip()
+    st.toast("호텔 설정 정보가 저장되었습니다.")
+
+
+def connect_gmaps():
+    link = st.session_state.get("input_gmaps", "").strip()
+
+    if not link:
+        st.toast("Google Maps 링크를 입력해주세요.")
+        return
+
+    st.session_state["gmaps_link"] = link
+    st.toast("링크가 등록되었습니다. 리뷰 자동 수집은 아직 연결되지 않았습니다.")
+
+
+def on_period_change():
+    st.toast(f"{st.session_state['period']} 데이터로 변경되었습니다.")
+
+
+# ───────────── 공통 조각 ─────────────
+
+def copy_button(text, height=42):
+    """클립보드 복사 버튼 (Streamlit에는 기본 복사 버튼이 없어 작은 HTML로 만든다)."""
+    payload = json.dumps(text).replace("</", "<\\/")
+    page = f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@700&family=Noto+Sans+KR:wght@700&display=swap');
+        body {{ margin: 0; }}
+        button {{
+            width: 100%; height: 38px; background: #fff; color: #475569;
+            border: 1px solid #e2e8f0; border-radius: 8px; cursor: pointer;
+            font: 700 12px 'DM Sans', 'Noto Sans KR', sans-serif;
+            transition: background .2s ease;
+        }}
+        button:hover {{ background: #eeeffe; color: #4f46e5; }}
+        </style>
+        <button id="b">문구 복사</button>
+        <script>
+        const text = {payload};
+        const btn = document.getElementById('b');
+        btn.onclick = () => {{
+            const area = document.createElement('textarea');
+            area.value = text;
+            document.body.appendChild(area);
+            area.select();
+            try {{ document.execCommand('copy'); }} catch (e) {{}}
+            document.body.removeChild(area);
+            if (navigator.clipboard) {{ navigator.clipboard.writeText(text).catch(() => {{}}); }}
+            btn.textContent = '복사되었습니다 ✓';
+            setTimeout(() => {{ btn.textContent = '문구 복사'; }}, 1500);
+        }};
+        </script>
+        """
+
+    if hasattr(st, "iframe"):
+        st.iframe(page, height=height)
+    else:
+        components.html(page, height=height)
+
+
+def topline_html(tight=False):
+    today = datetime.now().strftime("%Y. %m. %d")
+    return H(
+        f"""
+        <div class="topline{' tight' if tight else ''}">
+            <div class="crumb">AIGHT / HOTEL WORKSPACE</div>
+            <div class="top-actions">
+                <span class="date">{today}</span>
+                <div class="avatar">{escape(st.session_state['avatar'])}</div>
+            </div>
+        </div>
+        """
+    )
+
+
+def page_head_html(eyebrow, title, description):
+    return H(
+        f"""
+        <div class="page-head">
+            <div class="eyebrow">{escape(eyebrow)}</div>
+            <div class="page-title">{escape(title)}</div>
+            <div class="page-desc">{escape(description)}</div>
+        </div>
+        """
+    )
+
+
+def metrics_html(items):
+    cells = "".join(
+        f'<div class="metric"><div class="label">{label}</div>'
+        f'<div class="value">{value}</div>'
+        f'<div class="sub{" up" if up else ""}">{sub}</div></div>'
+        for label, value, sub, up in items
+    )
+    return f'<div class="metrics">{cells}</div>'
+
+
+def keyword_list_html(items):
+    return (
+        '<div class="keyword-list">'
+        + "".join(
+            f'<div class="keyword"><span>{name}</span>'
+            f'<div class="track"><div class="fill" style="width:{pct}%"></div></div>'
+            f"<b>{pct}%</b></div>"
+            for name, pct in items
+        )
+        + "</div>"
+    )
+
+
+def pill_class(label):
+    return "positive" if label == "긍정" else "negative"
+
+
+# ───────────── 사이드바 ─────────────
 
 def sidebar():
     with st.sidebar:
         st.markdown(
-            """
-            <div class="brand">
-                <div class="brand-mark">A</div>
-                <div class="brand-name">AIGHT</div>
-                <div class="brand-caption">HOTEL MARKETING AGENT</div>
-                <div class="brand-slogan">We make AI right.</div>
-            </div>
-            <div class="nav-label">WORKSPACE</div>
-            """,
+            H(
+                """
+                <div class="brand">
+                    <div class="brand-small">AIGHT</div>
+                    <div class="brand-title">Hotel Marketing</div>
+                    <div class="brand-sub">We make AI right</div>
+                </div>
+                <div class="nav-label">WORKSPACE</div>
+                """
+            ),
             unsafe_allow_html=True,
         )
 
         choice = st.radio(
             "메뉴",
             list(MENU.keys()),
+            key="nav",
             label_visibility="collapsed",
         )
 
         st.markdown(
-            """
-            <div class="sidebar-hotel">
-                <div class="hotel-label">CURRENT HOTEL</div>
-                <div class="hotel-name">Arban Hotel</div>
-                <div class="hotel-location">Busan · Seomyeon</div>
-            </div>
-            <div class="sidebar-footer">
-                <span class="status-dot"></span> AI MARKETING WORKSPACE
-            </div>
-            """,
+            H(
+                f"""
+                <div class="hotel-chip">
+                    <span>현재 분석 대상</span>
+                    <strong>{escape(st.session_state['hotel_name'])}</strong>
+                    <small>{escape(st.session_state['hotel_loc'])}</small>
+                </div>
+                """
+            ),
             unsafe_allow_html=True,
         )
 
     return MENU[choice]
 
 
-def topbar(title, description):
-    left, right = st.columns([5, 1.5], vertical_alignment="center")
+# ───────────── 1. 대시보드 ─────────────
+
+def dashboard_page():
+    name = st.session_state["hotel_name"]
+
+    st.markdown(topline_html(tight=True), unsafe_allow_html=True)
+
+    left, right = st.columns([5, 1], vertical_alignment="bottom")
 
     with left:
         st.markdown(
-            f"""
-            <div class="page-eyebrow">AIGHT / HOTEL WORKSPACE</div>
-            <div class="page-title">{escape(title)}</div>
-            <div class="page-description">{escape(description)}</div>
-            """,
+            page_head_html(
+                f"OVERVIEW / {name.upper()}",
+                "호텔 마케팅 대시보드",
+                "아르반호텔의 고객 반응을 살펴보고 다음 마케팅 기회를 확인하세요.",
+            ),
             unsafe_allow_html=True,
         )
 
     with right:
-        st.selectbox(
-            "분석 지점",
-            ["Arban Hotel · 부산 서면점"],
+        period = st.selectbox(
+            "조회 기간",
+            PERIODS,
+            index=2,
+            key="period",
+            on_change=on_period_change,
             label_visibility="collapsed",
         )
 
-    st.markdown('<div class="top-divider"></div>', unsafe_allow_html=True)
-
-
-def section_title(title, description=None):
-    sub = f'<span class="section-description">{escape(description)}</span>' if description else ""
-    st.markdown(
-        f'<div class="section-heading"><span>{title}</span>{sub}</div>',
-        unsafe_allow_html=True,
+    chart_sub = (
+        "최근 6개월 · 글로벌 데이터" if period == "최근 6개월" else f"{period} · 수집 데이터"
     )
 
+    bars = "".join(
+        f'<div class="bar-col"><div class="bar" style="height:{height}%"></div>'
+        f"<span>{month}</span></div>"
+        for month, height in MONTHLY_REVIEWS
+    )
 
-def metric_card(label, value, caption, icon):
+    highlights = "".join(
+        f'<div class="review"><span class="pill {pill_class(kind)}">{kind}</span>'
+        f'<div class="rv-text">{text}</div><small>{tag}</small></div>'
+        for kind, text, tag in HIGHLIGHTS
+    )
+
     st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-top">
-                <span class="metric-label">{escape(label)}</span>
-                <span class="metric-icon">{icon}</span>
+        H(
+            f"""
+            <div class="notice">글로벌 고객 데이터 및 Google Maps 리뷰 분석 기반 대시보드 시안입니다.</div>
+            {metrics_html(DASHBOARD_METRICS)}
+            <div class="grid">
+                <div class="panel">
+                    <div class="panel-head"><div class="panel-title">월별 리뷰 흐름</div><span class="muted">리뷰 수</span></div>
+                    <div class="panel-sub">{chart_sub}</div>
+                    <div class="chart">{bars}</div>
+                </div>
+                <div class="panel">
+                    <div class="panel-head"><div class="panel-title">고객이 자주 언급한 주제</div><span class="muted">언급 비중</span></div>
+                    <div class="panel-sub">리뷰 핵심 키워드 분석</div>
+                    {keyword_list_html(TOPICS)}
+                </div>
             </div>
-            <div class="metric-value">{escape(str(value))}</div>
-            <div class="metric-caption">{escape(caption)}</div>
-        </div>
-        """,
+            <div class="panel gap-bottom">
+                <div class="panel-head"><div class="panel-title">최근 리뷰 하이라이트</div><span class="muted">대표 의견</span></div>
+                <div class="panel-sub">언어권별 대표 리뷰 요약</div>
+                <div class="review-grid">{highlights}</div>
+            </div>
+            """
+        ),
         unsafe_allow_html=True,
     )
 
 
-def dashboard_page():
-    topbar(
-        "대시보드",
-        "호텔 리뷰와 마케팅 콘텐츠 성과를 한눈에 확인하세요.",
-    )
-
-    st.markdown(
-        '<div class="notice-strip"><span class="notice-dot"></span>'
-        '현재 표시되는 분석 수치는 화면 확인을 위한 샘플 데이터입니다.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    section_title("Overview", "호텔 마케팅 현황")
-
-    cols = st.columns(4)
-    metrics = [
-        ("긍정 리뷰 비율", f'{REVIEW["positive_ratio"]}%', "샘플 리뷰 분석 기준", "↗"),
-        ("분석 대상 언어", "4개", "영어 · 중국어 · 일본어 · 러시아어", "◎"),
-        ("긍정 키워드", len(REVIEW["positive_keywords"]), "샘플 리뷰에서 추출", "＋"),
-        ("개선 키워드", len(REVIEW["negative_keywords"]), "샘플 리뷰에서 추출", "⌁"),
-    ]
-
-    for col, item in zip(cols, metrics):
-        with col:
-            metric_card(*item)
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    left, right = st.columns([1.5, 1], gap="large")
-
-    with left:
-        with st.container(key="dashboard_performance"):
-            section_title("언어별 콘텐츠 반응", "언어별 노출수와 참여율 비교")
-
-            df = pd.DataFrame(PERFORMANCE).melt(
-                "언어",
-                var_name="지표",
-                value_name="값",
-            )
-
-            chart = (
-                alt.Chart(df)
-                .mark_bar(
-                    cornerRadiusTopLeft=5,
-                    cornerRadiusTopRight=5,
-                    size=22,
-                )
-                .encode(
-                    x=alt.X(
-                        "언어:N",
-                        sort=None,
-                        axis=alt.Axis(title=None, labelAngle=0),
-                    ),
-                    xOffset="지표:N",
-                    y=alt.Y(
-                        "값:Q",
-                        scale=alt.Scale(domain=[0, 100]),
-                        axis=alt.Axis(title=None, ticks=False, grid=True),
-                    ),
-                    color=alt.Color(
-                        "지표:N",
-                        scale=alt.Scale(
-                            domain=["노출수", "참여율"],
-                            range=["#C7C9F8", "#6259D9"],
-                        ),
-                        legend=alt.Legend(
-                            orient="top",
-                            direction="horizontal",
-                            title=None,
-                        ),
-                    ),
-                    tooltip=["언어", "지표", "값"],
-                )
-                .properties(height=250)
-                .configure_view(strokeWidth=0)
-                .configure(background="#FFFFFF")
-            )
-
-            st.altair_chart(chart, use_container_width=True)
-            st.caption("※ 샘플 데이터 기준이며 실제 마케팅 성과가 아닙니다.")
-
-    with right:
-        with st.container(key="dashboard_keywords"):
-            section_title("리뷰 주요 키워드", "고객 리뷰에서 확인한 긍정 및 개선 요소")
-
-            positive = "".join(
-                f'<span class="keyword-chip">{escape(word)}</span>'
-                for word in REVIEW["positive_keywords"]
-            )
-            negative = "".join(
-                f'<span class="keyword-chip">{escape(word)}</span>'
-                for word in REVIEW["negative_keywords"]
-            )
-
-            st.markdown(
-                f"""
-                <div class="keyword-panel positive-panel">
-                    <div class="keyword-panel-title">
-                        <span class="keyword-symbol">＋</span> 긍정 키워드
-                    </div>
-                    {positive}
-                </div>
-                <div class="keyword-panel negative-panel">
-                    <div class="keyword-panel-title">
-                        <span class="keyword-symbol">!</span> 개선이 필요한 키워드
-                    </div>
-                    {negative}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    with st.container(key="dashboard_quick"):
-        section_title("Quick Access", "자주 사용하는 기능")
-
-        q1, q2, q3 = st.columns(3)
-
-        with q1:
-            st.markdown(
-                '<div class="quick-card"><div class="quick-icon">✦</div>'
-                '<div class="quick-title">콘텐츠 생성</div>'
-                '<div class="quick-desc">다국어 홍보 콘텐츠 제작</div></div>',
-                unsafe_allow_html=True,
-            )
-        with q2:
-            st.markdown(
-                '<div class="quick-card"><div class="quick-icon">◉</div>'
-                '<div class="quick-title">리뷰 분석</div>'
-                '<div class="quick-desc">고객 의견과 개선 요소 확인</div></div>',
-                unsafe_allow_html=True,
-            )
-        with q3:
-            st.markdown(
-                '<div class="quick-card"><div class="quick-icon">▤</div>'
-                '<div class="quick-title">프롬프트 보관함</div>'
-                '<div class="quick-desc">콘텐츠 제작 템플릿 관리</div></div>',
-                unsafe_allow_html=True,
-            )
-
+# ───────────── 2. 리뷰 분석 ─────────────
 
 def review_page():
-    topbar(
-        "리뷰 분석",
-        "고객 리뷰의 반응과 주요 키워드를 확인하세요.",
+    rows = "".join(
+        f"<tr><td>{stars}</td><td>{text}</td><td>{lang}</td>"
+        f'<td><span class="pill {pill_class(kind)}">{kind}</span></td></tr>'
+        for stars, text, lang, kind in REVIEW_SAMPLES
     )
 
     st.markdown(
-        '<div class="notice-strip"><span class="notice-dot"></span>'
-        '현재 리뷰 분석 결과는 sample_data.py의 샘플 데이터입니다. '
-        'Google Maps 리뷰 자동 수집 기능은 아직 연결되지 않았습니다.'
-        '</div>',
+        H(
+            f"""
+            {topline_html()}
+            {page_head_html("CUSTOMER VOICE", "Google 리뷰 분석", "고객이 남긴 평가에서 호텔의 강점과 개선 지점을 찾습니다.")}
+            <div class="notice">글로벌 방문객 데이터를 분석하여 감성 분류 및 주요 키워드를 도출한 결과입니다.</div>
+            {metrics_html(REVIEW_METRICS)}
+            <div class="grid">
+                <div class="panel">
+                    <div class="panel-title">언어별 리뷰 비중</div>
+                    <div class="panel-sub">타깃 언어권 분포</div>
+                    {keyword_list_html(LANGUAGE_SHARE)}
+                </div>
+                <div class="panel">
+                    <div class="panel-title">분석 요약 및 인사이트</div>
+                    <div class="panel-sub">마케팅 개선 반영점</div>
+                    <div class="insight">{INSIGHT_TEXT}</div>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">리뷰 원문 예시</div>
+                <div class="panel-sub">언어 및 감성 분류 상세</div>
+                <table class="table">
+                    <thead><tr><th>평점</th><th>리뷰 내용</th><th>언어</th><th>분류</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+            """
+        ),
         unsafe_allow_html=True,
     )
 
-    section_title("Review Summary", "리뷰 데이터 요약")
 
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        metric_card(
-            "긍정 리뷰 비율",
-            f'{REVIEW["positive_ratio"]}%',
-            "샘플 데이터",
-            "↗",
-        )
-    with c2:
-        metric_card(
-            "긍정 키워드",
-            len(REVIEW["positive_keywords"]),
-            "고객 만족 요소",
-            "＋",
-        )
-    with c3:
-        metric_card(
-            "개선 키워드",
-            len(REVIEW["negative_keywords"]),
-            "확인 및 개선 필요 요소",
-            "!",
-        )
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    left, right = st.columns([1, 1], gap="large")
-
-    with left:
-        with st.container(key="review_positive"):
-            section_title("긍정 리뷰 키워드")
-            for word in REVIEW["positive_keywords"]:
-                st.markdown(
-                    f'<div class="review-word positive-word">'
-                    f'<span>＋</span>{escape(word)}</div>',
-                    unsafe_allow_html=True,
-                )
-
-    with right:
-        with st.container(key="review_negative"):
-            section_title("개선 필요 키워드")
-            for word in REVIEW["negative_keywords"]:
-                st.markdown(
-                    f'<div class="review-word negative-word">'
-                    f'<span>!</span>{escape(word)}</div>',
-                    unsafe_allow_html=True,
-                )
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    with st.container(key="review_language"):
-        section_title("언어별 콘텐츠 반응", "언어별 노출수와 참여율")
-
-        df = pd.DataFrame(PERFORMANCE).melt(
-            "언어",
-            var_name="지표",
-            value_name="값",
-        )
-
-        chart = (
-            alt.Chart(df)
-            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-            .encode(
-                x=alt.X("언어:N", sort=None, axis=alt.Axis(title=None)),
-                xOffset="지표:N",
-                y=alt.Y("값:Q", scale=alt.Scale(domain=[0, 100]), axis=alt.Axis(title=None)),
-                color=alt.Color(
-                    "지표:N",
-                    scale=alt.Scale(
-                        domain=["노출수", "참여율"],
-                        range=["#C7C9F8", "#6259D9"],
-                    ),
-                    legend=alt.Legend(orient="top", title=None),
-                ),
-                tooltip=["언어", "지표", "값"],
-            )
-            .properties(height=280)
-            .configure_view(strokeWidth=0)
-            .configure(background="#FFFFFF")
-        )
-
-        st.altair_chart(chart, use_container_width=True)
-        st.caption("※ 실제 리뷰 데이터와 연결되기 전까지 샘플 데이터로 표시됩니다.")
-
+# ───────────── 3. 콘텐츠 생성 ─────────────
 
 def generate_page():
-    topbar(
-        "콘텐츠 생성",
-        "호텔의 마케팅 목적에 맞는 다국어 홍보 콘텐츠를 제작하세요.",
+    st.markdown(
+        topline_html()
+        + page_head_html(
+            "CONTENT STUDIO",
+            "호텔 마케팅 콘텐츠 생성",
+            "핵심 키워드와 프롬프트 조합으로 다국어 콘텐츠 및 FAQ를 자동 생성합니다.",
+        ),
+        unsafe_allow_html=True,
     )
 
     if not has_api_key():
@@ -390,159 +433,197 @@ def generate_page():
             "실제 AI 콘텐츠 생성 기능을 사용할 수 있습니다."
         )
 
-    with st.container(key="content_generator"):
-        section_title("Create Content", "생성할 콘텐츠의 조건을 선택하세요.")
+    st.session_state.setdefault("extra_req", "")
 
-        c1, c2 = st.columns([1, 1])
+    left, right = st.columns([1.45, 1], gap="small")
 
-        with c1:
-            keywords = st.multiselect(
-                "마케팅 키워드",
-                options=[
-                    "서면 쇼핑",
-                    "부산 미식 투어",
-                    "시즌 패키지",
-                ],
-                default=[
-                    "서면 쇼핑",
-                    "부산 미식 투어",
-                    "시즌 패키지",
-                ],
-                accept_new_options=True,
-                placeholder="키워드를 선택하거나 직접 입력하세요.",
+    with left:
+        with st.container(key="panel_content_form"):
+            st.markdown('<div class="panel-title">콘텐츠 설정</div>', unsafe_allow_html=True)
+
+            lang_options = [key for key in LANG_ORDER if key in languages]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                lang_key = st.selectbox(
+                    "콘텐츠 언어",
+                    lang_options,
+                    format_func=lambda key: languages[key]["label"],
+                )
+            with c2:
+                channel_key = st.selectbox(
+                    "게시 채널",
+                    list(channels.keys()),
+                    format_func=lambda key: channels[key]["label"],
+                )
+
+            c3, c4 = st.columns(2)
+            with c3:
+                purpose = st.selectbox("홍보 목적", PURPOSES)
+            with c4:
+                tone = st.selectbox("문체 (톤앤매너)", TONES)
+
+            extra = st.text_area(
+                "추가 요청 (또는 프롬프트 라이브러리 자동 적용란)",
+                key="extra_req",
+                placeholder="예: 서면역 7번 출구 접근성 및 주변 전통시장 맛집 정보를 강조해 주세요.",
+                height=120,
             )
 
-        with c2:
-            channel_key = st.selectbox(
-                "콘텐츠 유형",
-                options=list(channels.keys()),
-                format_func=lambda key: channels[key]["label"],
+            clicked = st.button("콘텐츠 초안 만들기", type="primary")
+
+            if clicked:
+                request = f"문체: {tone}"
+                if extra.strip():
+                    request += f"\n{extra.strip()}"
+
+                with st.spinner("다국어 콘텐츠를 생성하고 있습니다..."):
+                    text = generate(purpose, lang_key, channel_key, request)
+
+                st.session_state["draft"] = {
+                    "text": text,
+                    "meta": f"{languages[lang_key]['label']} · {channels[channel_key]['label']} · {purpose}",
+                    "lang": lang_key,
+                    "channel": channel_key,
+                }
+                st.toast("마케팅 콘텐츠 초안이 생성되었습니다.")
+
+    draft = st.session_state.get("draft")
+
+    with right:
+        with st.container(key="panel_content_preview"):
+            meta = draft["meta"] if draft else "선택한 조건에 맞춘 다국어 콘텐츠"
+            body = (
+                escape(draft["text"]).replace("\n", "<br>")
+                if draft
+                else "왼쪽에서 콘텐츠 조건을 선택하거나 프롬프트 보관함에서 적용할 문구를 선택한 뒤 초안을 만들어 보세요."
             )
 
-        st.markdown("<div class='form-gap'></div>", unsafe_allow_html=True)
-
-        lang_keys = st.pills(
-            "대상 언어",
-            options=[key for key in LANG_ORDER if key in languages],
-            default=["en", "zh", "ja", "ru"],
-            selection_mode="multi",
-            format_func=lambda key: (
-                f'{languages[key]["flag"]} {languages[key]["label"]}'
-            ),
-        )
-
-        extra = st.text_area(
-            "추가 요청",
-            placeholder="예: 20대 여행객을 대상으로 가볍고 친근한 말투로 작성",
-            height=90,
-        )
-
-        clicked = st.button(
-            "✦ 다국어 콘텐츠 생성하기",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if clicked:
-        if not keywords:
-            st.warning("마케팅 키워드를 하나 이상 선택해 주세요.")
-        elif not lang_keys:
-            st.warning("대상 언어를 하나 이상 선택해 주세요.")
-        else:
-            results = {}
-
-            with st.spinner("다국어 콘텐츠를 생성하고 있습니다..."):
-                for language_key in lang_keys:
-                    results[language_key] = generate(
-                        ", ".join(keywords),
-                        language_key,
-                        channel_key,
-                        extra,
-                    )
-
-            st.session_state["results"] = results
-            st.session_state["channel_key"] = channel_key
-
-    results = st.session_state.get("results")
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    with st.container(key="content_results"):
-        section_title("Generated Content", "언어별 생성 결과")
-
-        if not results:
             st.markdown(
-                '<div class="empty-state">'
-                '<div class="empty-icon">✦</div>'
-                '<div class="empty-title">아직 생성된 콘텐츠가 없습니다.</div>'
-                '<div class="empty-description">'
-                '위에서 키워드와 언어를 선택하고 콘텐츠를 생성해 주세요.'
-                '</div></div>',
+                H(
+                    f"""
+                    <div class="panel-title">생성 결과 미리보기</div>
+                    <div class="panel-sub">{escape(meta)}</div>
+                    <div class="draft-box">{body}</div>
+                    """
+                ),
                 unsafe_allow_html=True,
             )
-            return
 
-        current_channel = channels[st.session_state["channel_key"]]
+            if not draft:
+                st.button("문구 복사", disabled=True)
+                return
 
-        items = list(results.items())
+            copy_button(draft["text"])
 
-        for start in range(0, len(items), 2):
-            row = items[start:start + 2]
-            cols = st.columns(2)
+            channel = channels[draft["channel"]]
+            checks = run_checks(draft["text"], channel["max_chars"], banned)
+            pills = "".join(
+                f'<span class="pill {"positive" if ok else "negative"}">{escape(message)}</span>'
+                for ok, message in checks
+            )
+            st.markdown(f'<div class="pill-row">{pills}</div>', unsafe_allow_html=True)
 
-            for col, (language_key, content) in zip(cols, row):
-                with col:
-                    with st.container(border=True):
-                        language = languages[language_key]
+            if draft["lang"] != "ko":
+                with st.expander("한국어 역번역으로 확인"):
+                    if st.button("역번역하기", key="back_translate"):
+                        st.write(back_translate(draft["text"], draft["lang"]))
 
-                        st.markdown(
-                            f'<div class="result-language">'
-                            f'{language["flag"]} {escape(language["label"])}'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
 
-                        st.text_area(
-                            "생성된 콘텐츠",
-                            value=content,
-                            height=190,
-                            key=f"result_text_{language_key}",
-                        )
-
-                        checks = run_checks(
-                            content,
-                            current_channel["max_chars"],
-                            banned,
-                        )
-
-                        pills = "".join(
-                            f'<span class="check-pill {"check-ok" if ok else "check-warn"}">'
-                            f'{escape(message)}</span>'
-                            for ok, message in checks
-                        )
-
-                        st.markdown(
-                            f'<div class="check-list">{pills}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        if language_key != "ko":
-                            with st.expander("한국어 역번역으로 확인"):
-                                if st.button(
-                                    "역번역하기",
-                                    key=f"back_translate_{language_key}",
-                                ):
-                                    st.write(back_translate(content, language_key))
-
+# ───────────── 4. 프롬프트 보관함 ─────────────
 
 def library_page():
-    topbar(
-        "프롬프트 보관함",
-        "AI 콘텐츠 생성에 사용하는 기본 프롬프트와 언어별 설정을 확인하세요.",
+    st.markdown(
+        topline_html()
+        + page_head_html(
+            "PROMPT LIBRARY",
+            "프롬프트 보관함",
+            "담당자가 변경되더라도 기존 마케팅 방향과 제작 기준을 표준화하여 일관성을 유지합니다.",
+        ),
+        unsafe_allow_html=True,
     )
 
-    with st.container(key="library_base"):
-        section_title("Base Prompt", "전체 콘텐츠 생성에 적용되는 기본 지침")
+    st.session_state.setdefault("new_prompt_title", "")
+    st.session_state.setdefault("new_prompt_content", "")
+
+    with st.container(key="panel_prompt_new"):
+        st.markdown(
+            '<div class="panel-title">새 마케팅 프롬프트 등록 (표준화 관리)</div>',
+            unsafe_allow_html=True,
+        )
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.selectbox("카테고리 선택", PROMPT_CATEGORIES, key="new_prompt_tag")
+        with c2:
+            st.text_input(
+                "프롬프트 제목",
+                key="new_prompt_title",
+                placeholder="예: [서면역 접근성] 다국어 인스타그램 홍보 템플릿",
+            )
+
+        st.text_area(
+            "프롬프트 지시문 (보관함 저장 지시문)",
+            key="new_prompt_content",
+            placeholder="국가별 문화와 언어 특성을 반영한 마케팅 지시문 프롬프트를 등록하세요.",
+            height=70,
+        )
+
+        st.button(
+            "+ 프롬프트 라이브러리에 저장",
+            type="primary",
+            on_click=save_prompt,
+        )
+
+    prompts = st.session_state["prompts"]
+
+    for start in range(0, len(prompts), 3):
+        cols = st.columns(3, gap="small")
+
+        for col, item in zip(cols, prompts[start:start + 3]):
+            with col:
+                with st.container(key=f"card_prompt_{item['id']}"):
+                    top_left, top_right = st.columns([5, 1], vertical_alignment="center")
+
+                    with top_left:
+                        st.markdown(
+                            f'<span class="pill">{escape(item["tag"])}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    with top_right:
+                        st.button(
+                            "×",
+                            key=f"del_{item['id']}",
+                            type="tertiary",
+                            help="삭제",
+                            on_click=delete_prompt,
+                            args=(item["id"],),
+                        )
+
+                    st.markdown(
+                        H(
+                            f"""
+                            <div class="rv-text"><b>{escape(item["title"])}</b><br>
+                            <span>{escape(item["content"])}</span></div>
+                            """
+                        ),
+                        unsafe_allow_html=True,
+                    )
+
+                    b1, b2 = st.columns([2.3, 1], vertical_alignment="center")
+                    with b1:
+                        st.button(
+                            "이 프롬프트로 콘텐츠 생성 ➔",
+                            key=f"use_{item['id']}",
+                            type="primary",
+                            **STRETCH,
+                            on_click=use_prompt,
+                            args=(item["content"],),
+                        )
+                    with b2:
+                        copy_button(item["content"])
+
+    with st.expander("시스템 기본 설정 보기 (기본 프롬프트 · 언어 · 콘텐츠 유형)"):
         prompt_path = ROOT / "prompts" / "base_prompt.txt"
 
         if prompt_path.exists():
@@ -553,11 +634,6 @@ def library_page():
             )
         else:
             st.info("prompts/base_prompt.txt 파일을 찾을 수 없습니다.")
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    with st.container(key="library_language"):
-        section_title("Language Settings", "언어별 말투와 문화적 표현 설정")
 
         st.dataframe(
             pd.DataFrame(
@@ -571,16 +647,10 @@ def library_page():
                     for value in languages.values()
                 ]
             ),
-            use_container_width=True,
+            **STRETCH,
             hide_index=True,
         )
-
         st.caption("설정 변경은 prompts/languages.json 파일에서 진행합니다.")
-
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
-
-    with st.container(key="library_channel"):
-        section_title("Content Type Settings", "콘텐츠 유형별 글자 수와 작성 규칙")
 
         st.dataframe(
             pd.DataFrame(
@@ -593,72 +663,60 @@ def library_page():
                     for value in channels.values()
                 ]
             ),
-            use_container_width=True,
+            **STRETCH,
             hide_index=True,
         )
-
         st.caption("설정 변경은 prompts/channels.json 파일에서 진행합니다.")
 
 
+# ───────────── 5. 설정 ─────────────
+
 def settings_page():
-    topbar(
-        "설정",
-        "AIGHT 서비스의 연결 상태와 기본 설정을 확인하세요.",
+    st.markdown(
+        topline_html()
+        + page_head_html(
+            "WORKSPACE SETTINGS",
+            "설정",
+            "분석 대상 호텔과 화면 표시 옵션을 관리합니다.",
+        ),
+        unsafe_allow_html=True,
     )
 
-    with st.container(key="settings_api"):
-        section_title("API Connection", "AI 콘텐츠 생성 연결 상태")
+    if "input_hotel_name" not in st.session_state:
+        st.session_state["input_hotel_name"] = st.session_state["hotel_name"]
+    if "input_hotel_loc" not in st.session_state:
+        st.session_state["input_hotel_loc"] = "부산광역시 부산진구 서면"
+    if "input_gmaps" not in st.session_state:
+        st.session_state["input_gmaps"] = st.session_state["gmaps_link"]
 
-        if has_api_key():
-            st.success("OpenAI API 키가 연결되어 있습니다.")
-        else:
-            st.warning("OpenAI API 키가 연결되지 않았습니다.")
+    with st.container(key="panel_settings"):
+        st.markdown('<div class="panel-title">호텔 정보 설정</div>', unsafe_allow_html=True)
 
-        st.caption("API 키는 프로젝트 루트의 .env 파일에서 설정합니다.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.text_input("호텔명", key="input_hotel_name")
+        with c2:
+            st.text_input("지역", key="input_hotel_loc")
 
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
+        g1, g2 = st.columns([5, 1], vertical_alignment="bottom")
+        with g1:
+            st.text_input("Google Maps 링크 (리뷰 데이터 연동)", key="input_gmaps")
+        with g2:
+            st.button("연동하기", on_click=connect_gmaps, **STRETCH)
 
-    with st.container(key="settings_check"):
-        section_title("Content Check", "콘텐츠 생성 시 적용되는 검사 설정")
+        st.markdown('<div class="settings-divider"></div>', unsafe_allow_html=True)
 
-        st.markdown(
-            f"""
-            <div class="setting-row">
-                <span>금지 표현 등록 수</span>
-                <strong>{len(banned)}개</strong>
-            </div>
-            <div class="setting-row">
-                <span>금지 표현 설정 파일</span>
-                <strong>prompts/banned_words.txt</strong>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        s1, s2 = st.columns([3, 1])
+        with s2:
+            st.button(
+                "설정 저장하기",
+                type="primary",
+                on_click=save_settings,
+                **STRETCH,
+            )
 
-    st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
 
-    with st.container(key="settings_hotel"):
-        section_title("Hotel Information", "현재 분석 대상 호텔")
-
-        st.markdown(
-            """
-            <div class="setting-row">
-                <span>호텔명</span>
-                <strong>Arban Hotel</strong>
-            </div>
-            <div class="setting-row">
-                <span>위치</span>
-                <strong>부산 부산진구 서면</strong>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.info(
-            "Google Maps 리뷰 자동 수집은 아직 연결되지 않았습니다. "
-            "현재 리뷰 분석 화면에는 샘플 데이터가 표시됩니다."
-        )
-
+# ───────────── 실행 ─────────────
 
 page = sidebar()
 
